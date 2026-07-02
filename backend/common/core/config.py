@@ -121,6 +121,14 @@ class Settings(BaseSettings):
     DEFAULT_REASONING_CONTENT_START: str = '<think>'
     DEFAULT_REASONING_CONTENT_END: str = '</think>'
 
+    # Observability: Langfuse tracing for the chat/Q&A pipeline.
+    # When LANGFUSE_ENABLED is false (or keys/host missing) tracing is fully
+    # disabled and the request flow is unaffected.
+    LANGFUSE_ENABLED: bool = False
+    LANGFUSE_HOST: str = ""
+    LANGFUSE_PUBLIC_KEY: str = ""
+    LANGFUSE_SECRET_KEY: str = ""
+
     PG_POOL_SIZE: int = 20
     PG_MAX_OVERFLOW: int = 30
     PG_POOL_RECYCLE: int = 3600
@@ -138,6 +146,7 @@ class Settings(BaseSettings):
                      'PARSE_REASONING_BLOCK_ENABLED',
                      'PG_POOL_PRE_PING',
                      'TABLE_EMBEDDING_ENABLED',
+                     'LANGFUSE_ENABLED',
                      mode='before')
     @classmethod
     def lowercase_bool(cls, v: Any) -> Any:

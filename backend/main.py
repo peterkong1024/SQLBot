@@ -23,6 +23,7 @@ from apps.system.middleware.auth import TokenMiddleware
 from apps.system.schemas.permission import RequestContextMiddleware
 from common.audit.schemas.request_context import RequestContextMiddlewareCommon
 from common.core.config import settings
+from common.observability.tracer import get_langfuse, shutdown as langfuse_shutdown
 from common.core.response_middleware import ResponseMiddleware, exception_handler
 from common.core.sqlbot_cache import init_sqlbot_cache
 from common.utils.embedding_threads import fill_empty_terminology_embeddings, fill_empty_data_training_embeddings, \
@@ -59,8 +60,13 @@ async def lifespan(app: FastAPI):
     await sqlbot_xpack.core.clean_xpack_cache()
     await async_model_info()  # 异步加密已有模型的密钥和地址
     await sqlbot_xpack.core.monitor_app(app)
+    # Warm the Langfuse client (no-op when tracing is disabled).
+    _lf = get_langfuse()
+    SQLBotLogUtil.info(f"Langfuse tracing {'enabled' if _lf is not None else 'disabled'}")
     yield
     SQLBotLogUtil.info("SQLBot 应用关闭")
+    # Flush any pending observations before exit.
+    langfuse_shutdown()
 
 
 def custom_generate_unique_id(route: APIRoute) -> str:

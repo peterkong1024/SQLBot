@@ -1,0 +1,38 @@
+# Lightweight image for backend tracing verification.
+# Reuses the runtime base (python 3.11 + uv + bundled postgres) but skips the
+# frontend npm build and g2-ssr stages to speed up iteration. The production
+# multi-stage Dockerfile works identically for the tracing change — this is
+# just a faster path to run the real backend with real instrumentation.
+FROM registry.cn-qingdao.aliyuncs.com/dataease/sqlbot-python-pg:latest
+
+ENV PYTHONUNBUFFERED=1
+ENV SQLBOT_HOME=/opt/sqlbot
+ENV APP_HOME=${SQLBOT_HOME}/app
+ENV PYTHONPATH=${APP_HOME}
+ENV PATH="${APP_HOME}/.venv/bin:/usr/bin:$PATH"
+ENV DEBIAN_FRONTEND=noninteractive
+
+ENV POSTGRES_DB=sqlbot
+ENV POSTGRES_USER=root
+ENV POSTGRES_PASSWORD=Password123@pg
+
+RUN mkdir -p ${APP_HOME} /opt/sqlbot/images /var/lib/postgresql/data
+WORKDIR ${APP_HOME}
+
+# Install backend dependencies first (cacheable layer). langfuse is pulled from
+# pyproject. uv resolves and creates a lock on the fly (no --frozen).
+COPY backend/pyproject.toml ${APP_HOME}/pyproject.toml
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --extra cpu --no-install-project
+
+# Copy backend source and do a final sync to install the project itself.
+COPY backend ${APP_HOME}
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --extra cpu
+
+COPY scripts/dev_start.sh /opt/sqlbot/dev_start.sh
+RUN chmod +x /opt/sqlbot/dev_start.sh
+
+EXPOSE 8000 5432
+
+ENTRYPOINT ["sh", "/opt/sqlbot/dev_start.sh"]

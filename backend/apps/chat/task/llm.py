@@ -52,6 +52,7 @@ from common.core.config import settings
 from common.core.db import engine
 from common.core.deps import CurrentAssistant, CurrentUser
 from common.error import SingleMessageError, SQLBotDBError, ParseSQLResultError, SQLBotDBConnectionError
+from common.observability.tracer import get_tracer, serialize_messages, map_usage
 from common.utils.data_format import DataFormat
 from common.utils.locale import I18n, I18nHelper
 from common.utils.utils import SQLBotLogUtil, extract_nested_json, prepare_for_orjson
@@ -123,6 +124,8 @@ class LLMService:
         self.generate_chart_logs = []
         self.current_logs = {}
         self.chunk_list = []
+        # Observability: per-request Langfuse tracer (no-op when disabled).
+        self.tracer = get_tracer()
         self.current_user = current_user
         self.current_assistant = current_assistant
 
@@ -335,6 +338,22 @@ class LLMService:
         self.record = save_question(session=session, current_user=self.current_user, question=self.chat_question)
         return self.record
 
+    # ---- Langfuse tracing helpers -------------------------------------
+    def _trace_session_id(self) -> Optional[str]:
+        if getattr(self, "record", None) is not None and self.record.chat_id:
+            return str(self.record.chat_id)
+        return str(self.chat_question.chat_id) if self.chat_question.chat_id else None
+
+    def _trace_user_id(self) -> Optional[str]:
+        return str(self.current_user.id) if self.current_user else None
+
+    def _trace_metadata(self) -> dict:
+        return {
+            "datasource": str(self.ds.id) if self.ds else None,
+            "engine": self.chat_question.engine or None,
+            "model": self.chat_question.ai_modal_name or None,
+        }
+
     def get_record(self):
         return self.record
 
@@ -352,22 +371,27 @@ class LLMService:
         self.current_logs[OperationEnum.FILTER_TERMS] = start_log(session=_session,
                                                                   operate=OperationEnum.FILTER_TERMS,
                                                                   record_id=self.record.id, local_operation=True)
-        calculate_oid = oid
-        calculate_ds_id = ds_id
-        if self.current_assistant:
-            calculate_oid = self.current_assistant.oid if self.current_assistant.type != 4 else self.oid
-            if self.current_assistant.type == 1:
-                calculate_ds_id = None
-        if self.current_assistant and self.current_assistant.type == 1:
-            self.chat_question.terminologies, term_list = get_terminology_template(_session,
-                                                                                   self.chat_question.question,
-                                                                                   calculate_oid,
-                                                                                   None, self.current_assistant.id)
-        else:
-            self.chat_question.terminologies, term_list = get_terminology_template(_session,
-                                                                                   self.chat_question.question,
-                                                                                   calculate_oid,
-                                                                                   calculate_ds_id)
+        with self.tracer.span(name="filter_terminology",
+                              input={"question": self.chat_question.question, "oid": oid, "ds_id": ds_id},
+                              metadata={"operate": OperationEnum.FILTER_TERMS.value}) as _span:
+            calculate_oid = oid
+            calculate_ds_id = ds_id
+            if self.current_assistant:
+                calculate_oid = self.current_assistant.oid if self.current_assistant.type != 4 else self.oid
+                if self.current_assistant.type == 1:
+                    calculate_ds_id = None
+            if self.current_assistant and self.current_assistant.type == 1:
+                self.chat_question.terminologies, term_list = get_terminology_template(_session,
+                                                                                       self.chat_question.question,
+                                                                                       calculate_oid,
+                                                                                       None, self.current_assistant.id)
+            else:
+                self.chat_question.terminologies, term_list = get_terminology_template(_session,
+                                                                                       self.chat_question.question,
+                                                                                       calculate_oid,
+                                                                                       calculate_ds_id)
+            _span.update(output={"matched": len(term_list or []),
+                                 "terminologies": self.chat_question.terminologies or ""})
 
         self.current_logs[OperationEnum.FILTER_TERMS] = end_log(session=_session,
                                                                 log=self.current_logs[OperationEnum.FILTER_TERMS],
@@ -380,22 +404,27 @@ class LLMService:
                                                                               operate=OperationEnum.FILTER_CUSTOM_PROMPT,
                                                                               record_id=self.record.id,
                                                                               local_operation=True)
-            calculate_oid = oid
-            calculate_ds_id = ds_id
-            if self.current_assistant:
-                calculate_oid = self.current_assistant.oid if self.current_assistant.type != 4 else self.oid
-                if self.current_assistant.type == 1:
-                    calculate_ds_id = None
-            if self.current_assistant and self.current_assistant.type == 1:
-                self.chat_question.custom_prompt, prompt_list = find_custom_prompts(_session,
-                                                                                    custom_prompt_type,
-                                                                                    calculate_oid,
-                                                                                    None, self.current_assistant.id)
-            else:
-                self.chat_question.custom_prompt, prompt_list = find_custom_prompts(_session,
-                                                                                    custom_prompt_type,
-                                                                                    calculate_oid,
-                                                                                    calculate_ds_id)
+            with self.tracer.span(name="filter_custom_prompt",
+                                  input={"type": str(custom_prompt_type), "oid": oid, "ds_id": ds_id},
+                                  metadata={"operate": OperationEnum.FILTER_CUSTOM_PROMPT.value}) as _span:
+                calculate_oid = oid
+                calculate_ds_id = ds_id
+                if self.current_assistant:
+                    calculate_oid = self.current_assistant.oid if self.current_assistant.type != 4 else self.oid
+                    if self.current_assistant.type == 1:
+                        calculate_ds_id = None
+                if self.current_assistant and self.current_assistant.type == 1:
+                    self.chat_question.custom_prompt, prompt_list = find_custom_prompts(_session,
+                                                                                        custom_prompt_type,
+                                                                                        calculate_oid,
+                                                                                        None, self.current_assistant.id)
+                else:
+                    self.chat_question.custom_prompt, prompt_list = find_custom_prompts(_session,
+                                                                                        custom_prompt_type,
+                                                                                        calculate_oid,
+                                                                                        calculate_ds_id)
+                _span.update(output={"matched": len(prompt_list or []),
+                                     "custom_prompt": self.chat_question.custom_prompt or ""})
             self.current_logs[OperationEnum.FILTER_CUSTOM_PROMPT] = end_log(session=_session,
                                                                             log=self.current_logs[
                                                                                 OperationEnum.FILTER_CUSTOM_PROMPT],
@@ -406,22 +435,27 @@ class LLMService:
                                                                         operate=OperationEnum.FILTER_SQL_EXAMPLE,
                                                                         record_id=self.record.id,
                                                                         local_operation=True)
-        calculate_oid = oid
-        calculate_ds_id = ds_id
-        if self.current_assistant:
-            calculate_oid = self.current_assistant.oid if self.current_assistant.type != 4 else self.oid
-            if self.current_assistant.type == 1:
-                calculate_ds_id = None
-        if self.current_assistant and self.current_assistant.type == 1:
-            self.chat_question.data_training, example_list = get_training_template(_session,
-                                                                                   self.chat_question.question,
-                                                                                   calculate_oid,
-                                                                                   None, self.current_assistant.id)
-        else:
-            self.chat_question.data_training, example_list = get_training_template(_session,
-                                                                                   self.chat_question.question,
-                                                                                   calculate_oid,
-                                                                                   calculate_ds_id)
+        with self.tracer.span(name="filter_sql_example",
+                              input={"question": self.chat_question.question, "oid": oid, "ds_id": ds_id},
+                              metadata={"operate": OperationEnum.FILTER_SQL_EXAMPLE.value}) as _span:
+            calculate_oid = oid
+            calculate_ds_id = ds_id
+            if self.current_assistant:
+                calculate_oid = self.current_assistant.oid if self.current_assistant.type != 4 else self.oid
+                if self.current_assistant.type == 1:
+                    calculate_ds_id = None
+            if self.current_assistant and self.current_assistant.type == 1:
+                self.chat_question.data_training, example_list = get_training_template(_session,
+                                                                                       self.chat_question.question,
+                                                                                       calculate_oid,
+                                                                                       None, self.current_assistant.id)
+            else:
+                self.chat_question.data_training, example_list = get_training_template(_session,
+                                                                                       self.chat_question.question,
+                                                                                       calculate_oid,
+                                                                                       calculate_ds_id)
+            _span.update(output={"matched": len(example_list or []),
+                                 "data_training": self.chat_question.data_training or ""})
         self.current_logs[OperationEnum.FILTER_SQL_EXAMPLE] = end_log(session=_session,
                                                                       log=self.current_logs[
                                                                           OperationEnum.FILTER_SQL_EXAMPLE],
@@ -432,20 +466,26 @@ class LLMService:
                                                                   operate=OperationEnum.CHOOSE_TABLE,
                                                                   record_id=self.record.id,
                                                                   local_operation=True)
-        self.chat_question.db_schema, tables = self.out_ds_instance.get_db_schema(
-            self.ds.id, self.chat_question.question) if self.out_ds_instance else get_table_schema(
-            session=_session,
-            current_user=self.current_user,
-            ds=self.ds,
-            question=self.chat_question.question)
-
-        # Get sample data for all tables
-        if not self.out_ds_instance:
-            self.chat_question.sample_data = get_tables_sample_data(
+        with self.tracer.span(name="choose_table_schema",
+                              input={"question": self.chat_question.question,
+                                     "ds_id": str(self.ds.id) if self.ds else None},
+                              metadata={"operate": OperationEnum.CHOOSE_TABLE.value}) as _span:
+            self.chat_question.db_schema, tables = self.out_ds_instance.get_db_schema(
+                self.ds.id, self.chat_question.question) if self.out_ds_instance else get_table_schema(
                 session=_session,
                 current_user=self.current_user,
                 ds=self.ds,
-                table_list=tables)
+                question=self.chat_question.question)
+
+            # Get sample data for all tables
+            if not self.out_ds_instance:
+                self.chat_question.sample_data = get_tables_sample_data(
+                    session=_session,
+                    current_user=self.current_user,
+                    ds=self.ds,
+                    table_list=tables)
+            _span.update(output={"tables": tables,
+                                 "schema_length": len(self.chat_question.db_schema or "")})
 
         self.current_logs[OperationEnum.CHOOSE_TABLE] = end_log(session=_session,
                                                                 log=self.current_logs[OperationEnum.CHOOSE_TABLE],
@@ -483,13 +523,17 @@ class LLMService:
         full_thinking_text = ''
         full_analysis_text = ''
         token_usage = {}
-        res = process_stream(self.llm.stream(analysis_msg), token_usage)
-        for chunk in res:
-            if chunk.get('content'):
-                full_analysis_text += chunk.get('content')
-            if chunk.get('reasoning_content'):
-                full_thinking_text += chunk.get('reasoning_content')
-            yield chunk
+        with self.tracer.generation(name="generate_analysis", model=self.chat_question.ai_modal_name,
+                                    input=serialize_messages(analysis_msg),
+                                    metadata={"operate": OperationEnum.ANALYSIS.value}) as gen:
+            res = process_stream(self.llm.stream(analysis_msg), token_usage)
+            for chunk in res:
+                if chunk.get('content'):
+                    full_analysis_text += chunk.get('content')
+                if chunk.get('reasoning_content'):
+                    full_thinking_text += chunk.get('reasoning_content')
+                yield chunk
+            gen.update(output=full_analysis_text, usage_details=map_usage(token_usage))
 
         analysis_msg.append(AIMessage(full_analysis_text))
 
@@ -535,13 +579,17 @@ class LLMService:
         full_thinking_text = ''
         full_predict_text = ''
         token_usage = {}
-        res = process_stream(self.llm.stream(predict_msg), token_usage)
-        for chunk in res:
-            if chunk.get('content'):
-                full_predict_text += chunk.get('content')
-            if chunk.get('reasoning_content'):
-                full_thinking_text += chunk.get('reasoning_content')
-            yield chunk
+        with self.tracer.generation(name="generate_predict", model=self.chat_question.ai_modal_name,
+                                    input=serialize_messages(predict_msg),
+                                    metadata={"operate": OperationEnum.PREDICT_DATA.value}) as gen:
+            res = process_stream(self.llm.stream(predict_msg), token_usage)
+            for chunk in res:
+                if chunk.get('content'):
+                    full_predict_text += chunk.get('content')
+                if chunk.get('reasoning_content'):
+                    full_thinking_text += chunk.get('reasoning_content')
+                yield chunk
+            gen.update(output=full_predict_text, usage_details=map_usage(token_usage))
 
         predict_msg.append(AIMessage(full_predict_text))
         self.record = save_predict_answer(session=_session, record_id=self.record.id,
@@ -599,13 +647,17 @@ class LLMService:
         full_thinking_text = ''
         full_guess_text = ''
         token_usage = {}
-        res = process_stream(self.llm.stream(guess_msg), token_usage)
-        for chunk in res:
-            if chunk.get('content'):
-                full_guess_text += chunk.get('content')
-            if chunk.get('reasoning_content'):
-                full_thinking_text += chunk.get('reasoning_content')
-            yield chunk
+        with self.tracer.generation(name="generate_recommend_questions", model=self.chat_question.ai_modal_name,
+                                    input=serialize_messages(guess_msg),
+                                    metadata={"operate": OperationEnum.GENERATE_RECOMMENDED_QUESTIONS.value}) as gen:
+            res = process_stream(self.llm.stream(guess_msg), token_usage)
+            for chunk in res:
+                if chunk.get('content'):
+                    full_guess_text += chunk.get('content')
+                if chunk.get('reasoning_content'):
+                    full_thinking_text += chunk.get('reasoning_content')
+                yield chunk
+            gen.update(output=full_guess_text, usage_details=map_usage(token_usage))
 
         guess_msg.append(AIMessage(full_guess_text))
 
@@ -677,13 +729,17 @@ class LLMService:
                                                                                          msg in datasource_msg])
 
             token_usage = {}
-            res = process_stream(self.llm.stream(datasource_msg), token_usage)
-            for chunk in res:
-                if chunk.get('content'):
-                    full_text += chunk.get('content')
-                if chunk.get('reasoning_content'):
-                    full_thinking_text += chunk.get('reasoning_content')
-                yield chunk
+            with self.tracer.generation(name="select_datasource", model=self.chat_question.ai_modal_name,
+                                        input=serialize_messages(datasource_msg),
+                                        metadata={"operate": OperationEnum.CHOOSE_DATASOURCE.value}) as gen:
+                res = process_stream(self.llm.stream(datasource_msg), token_usage)
+                for chunk in res:
+                    if chunk.get('content'):
+                        full_text += chunk.get('content')
+                    if chunk.get('reasoning_content'):
+                        full_thinking_text += chunk.get('reasoning_content')
+                    yield chunk
+                gen.update(output=full_text, usage_details=map_usage(token_usage))
             datasource_msg.append(AIMessage(full_text))
 
             self.current_logs[OperationEnum.CHOOSE_DATASOURCE] = end_log(session=_session,
@@ -792,13 +848,17 @@ class LLMService:
         full_thinking_text = ''
         full_sql_text = ''
         token_usage = {}
-        res = process_stream(self.llm.stream(self.sql_message), token_usage)
-        for chunk in res:
-            if chunk.get('content'):
-                full_sql_text += chunk.get('content')
-            if chunk.get('reasoning_content'):
-                full_thinking_text += chunk.get('reasoning_content')
-            yield chunk
+        with self.tracer.generation(name="generate_sql", model=self.chat_question.ai_modal_name,
+                                    input=serialize_messages(self.sql_message),
+                                    metadata={"operate": OperationEnum.GENERATE_SQL.value}) as gen:
+            res = process_stream(self.llm.stream(self.sql_message), token_usage)
+            for chunk in res:
+                if chunk.get('content'):
+                    full_sql_text += chunk.get('content')
+                if chunk.get('reasoning_content'):
+                    full_thinking_text += chunk.get('reasoning_content')
+                yield chunk
+            gen.update(output=full_sql_text, usage_details=map_usage(token_usage))
 
         self.sql_message.append(AIMessage(full_sql_text))
 
@@ -839,12 +899,16 @@ class LLMService:
         full_thinking_text = ''
         full_dynamic_text = ''
         token_usage = {}
-        res = process_stream(self.llm.stream(dynamic_sql_msg), token_usage)
-        for chunk in res:
-            if chunk.get('content'):
-                full_dynamic_text += chunk.get('content')
-            if chunk.get('reasoning_content'):
-                full_thinking_text += chunk.get('reasoning_content')
+        with self.tracer.generation(name="generate_dynamic_sql", model=self.chat_question.ai_modal_name,
+                                    input=serialize_messages(dynamic_sql_msg),
+                                    metadata={"operate": OperationEnum.GENERATE_DYNAMIC_SQL.value}) as gen:
+            res = process_stream(self.llm.stream(dynamic_sql_msg), token_usage)
+            for chunk in res:
+                if chunk.get('content'):
+                    full_dynamic_text += chunk.get('content')
+                if chunk.get('reasoning_content'):
+                    full_thinking_text += chunk.get('reasoning_content')
+            gen.update(output=full_dynamic_text, usage_details=map_usage(token_usage))
 
         dynamic_sql_msg.append(AIMessage(full_dynamic_text))
 
@@ -903,12 +967,16 @@ class LLMService:
         full_thinking_text = ''
         full_filter_text = ''
         token_usage = {}
-        res = process_stream(self.llm.stream(permission_sql_msg), token_usage)
-        for chunk in res:
-            if chunk.get('content'):
-                full_filter_text += chunk.get('content')
-            if chunk.get('reasoning_content'):
-                full_thinking_text += chunk.get('reasoning_content')
+        with self.tracer.generation(name="generate_sql_with_permissions", model=self.chat_question.ai_modal_name,
+                                    input=serialize_messages(permission_sql_msg),
+                                    metadata={"operate": OperationEnum.GENERATE_SQL_WITH_PERMISSIONS.value}) as gen:
+            res = process_stream(self.llm.stream(permission_sql_msg), token_usage)
+            for chunk in res:
+                if chunk.get('content'):
+                    full_filter_text += chunk.get('content')
+                if chunk.get('reasoning_content'):
+                    full_thinking_text += chunk.get('reasoning_content')
+            gen.update(output=full_filter_text, usage_details=map_usage(token_usage))
 
         permission_sql_msg.append(AIMessage(full_filter_text))
 
@@ -964,13 +1032,17 @@ class LLMService:
         full_thinking_text = ''
         full_chart_text = ''
         token_usage = {}
-        res = process_stream(self.llm.stream(self.chart_message), token_usage)
-        for chunk in res:
-            if chunk.get('content'):
-                full_chart_text += chunk.get('content')
-            if chunk.get('reasoning_content'):
-                full_thinking_text += chunk.get('reasoning_content')
-            yield chunk
+        with self.tracer.generation(name="generate_chart", model=self.chat_question.ai_modal_name,
+                                    input=serialize_messages(self.chart_message),
+                                    metadata={"operate": OperationEnum.GENERATE_CHART.value}) as gen:
+            res = process_stream(self.llm.stream(self.chart_message), token_usage)
+            for chunk in res:
+                if chunk.get('content'):
+                    full_chart_text += chunk.get('content')
+                if chunk.get('reasoning_content'):
+                    full_thinking_text += chunk.get('reasoning_content')
+                yield chunk
+            gen.update(output=full_chart_text, usage_details=map_usage(token_usage))
 
         self.chart_message.append(AIMessage(full_chart_text))
 
@@ -1176,14 +1248,18 @@ class LLMService:
             Query results
         """
         SQLBotLogUtil.info(f"Executing SQL on ds_id {self.ds.id}: {sql}")
-        try:
-            return exec_sql(ds=self.ds, sql=sql, origin_column=False)
-        except Exception as e:
-            if isinstance(e, ParseSQLResultError):
-                raise e
-            else:
-                err = traceback.format_exc(limit=1, chain=True)
-                raise SQLBotDBError(err)
+        with self.tracer.span(name="execute_sql", input={"sql": sql},
+                              metadata={"operate": OperationEnum.EXECUTE_SQL.value}) as _span:
+            try:
+                result = exec_sql(ds=self.ds, sql=sql, origin_column=False)
+                _span.update(output={"rows": len(result.get("data")) if result else 0})
+                return result
+            except Exception as e:
+                if isinstance(e, ParseSQLResultError):
+                    raise e
+                else:
+                    err = traceback.format_exc(limit=1, chain=True)
+                    raise SQLBotDBError(err)
 
     def pop_chunk(self):
         try:
@@ -1214,8 +1290,18 @@ class LLMService:
 
     def run_task_cache(self, in_chat: bool = True, stream: bool = True,
                        finish_step: ChatFinishStep = ChatFinishStep.GENERATE_CHART, return_img: bool = True):
-        for chunk in self.run_task(in_chat, stream, finish_step, return_img):
-            self.chunk_list.append(chunk)
+        with self.tracer.trace_context(
+                name="chat.question",
+                session_id=self._trace_session_id(),
+                user_id=self._trace_user_id(),
+                input={"question": self.chat_question.question, "chat_id": self.chat_question.chat_id},
+                metadata=self._trace_metadata()) as root:
+            for chunk in self.run_task(in_chat, stream, finish_step, return_img):
+                self.chunk_list.append(chunk)
+            root.update(output={"sql": getattr(self.chat_question, "sql", None) or None,
+                                "has_chart": bool(getattr(self.record, "chart", None)),
+                                "error": getattr(self.record, "error", None) or None})
+        self.tracer.flush()
 
     def run_task(self, in_chat: bool = True, stream: bool = True,
                  finish_step: ChatFinishStep = ChatFinishStep.GENERATE_CHART, return_img: bool = True):
@@ -1269,7 +1355,12 @@ class LLMService:
                 self.validate_history_ds(_session)
 
             # check connection
-            connected = check_connection(ds=self.ds, trans=None)
+            with self.tracer.span(name="check_connection",
+                                  input={"ds_id": str(self.ds.id) if self.ds else None,
+                                         "engine": self.chat_question.engine or None},
+                                  metadata={"ds_id": str(self.ds.id) if self.ds else None}) as _span:
+                connected = check_connection(ds=self.ds, trans=None)
+                _span.update(output={"connected": bool(connected)})
             if not connected:
                 raise SQLBotDBConnectionError('Connect DB failed')
 
@@ -1482,8 +1573,14 @@ class LLMService:
                                                                                       operate=OperationEnum.GENERATE_PICTURE,
                                                                                       record_id=self.record.id,
                                                                                       local_operation=True)
-                        image_url, error = request_picture(self.record.chat_id, self.record.id, chart,
-                                                           format_json_data(result))
+                        with self.tracer.span(name="render_chart_picture",
+                                              input={"chart_type": chart.get("type"),
+                                                     "rows": len(format_json_data(result).get("data") or [])},
+                                              metadata={"operate": OperationEnum.GENERATE_PICTURE.value}) as _span:
+                            image_url, error = request_picture(self.record.chat_id, self.record.id, chart,
+                                                               format_json_data(result))
+                            _span.update(output={"image_url": image_url,
+                                                 "error": str(error) if error else None})
                         SQLBotLogUtil.info(image_url)
                         if stream:
                             yield f'![{chart.get("type")}]({image_url})'
@@ -1538,8 +1635,16 @@ class LLMService:
         self.future = executor.submit(self.run_recommend_questions_task_cache)
 
     def run_recommend_questions_task_cache(self):
-        for chunk in self.run_recommend_questions_task():
-            self.chunk_list.append(chunk)
+        with self.tracer.trace_context(
+                name="chat.recommend",
+                session_id=self._trace_session_id(),
+                user_id=self._trace_user_id(),
+                input={"question": self.chat_question.question, "chat_id": self.chat_question.chat_id},
+                metadata=self._trace_metadata()) as root:
+            for chunk in self.run_recommend_questions_task():
+                self.chunk_list.append(chunk)
+            root.update(output={"recommended_question": getattr(self.record, "recommended_question", None) or None})
+        self.tracer.flush()
 
     def run_recommend_questions_task(self):
         try:
@@ -1566,8 +1671,21 @@ class LLMService:
         self.future = executor.submit(self.run_analysis_or_predict_task_cache, action_type, in_chat, stream)
 
     def run_analysis_or_predict_task_cache(self, action_type: str, in_chat: bool = True, stream: bool = True):
-        for chunk in self.run_analysis_or_predict_task(action_type, in_chat, stream):
-            self.chunk_list.append(chunk)
+        with self.tracer.trace_context(
+                name=f"chat.{action_type}",
+                session_id=self._trace_session_id(),
+                user_id=self._trace_user_id(),
+                input={"question": self.chat_question.question, "chat_id": self.chat_question.chat_id,
+                       "base_record_id": getattr(self.record, "id", None)},
+                metadata=self._trace_metadata()) as root:
+            for chunk in self.run_analysis_or_predict_task(action_type, in_chat, stream):
+                self.chunk_list.append(chunk)
+            if action_type == 'analysis':
+                root.update(output={"analysis": getattr(self.record, "analysis", None) or None})
+            else:
+                root.update(output={"predict": getattr(self.record, "predict", None) or None,
+                                    "has_predict_data": bool(getattr(self.record, "predict_data", None))})
+        self.tracer.flush()
 
     def run_analysis_or_predict_task(self, action_type: str, in_chat: bool = True, stream: bool = True):
         json_result: Dict[str, Any] = {'success': True}
@@ -1651,8 +1769,13 @@ class LLMService:
                                 _data = get_chat_chart_data(_session, self.record.id)
                                 _data['data'] = _data.get('data') + predict_data
 
-                                image_url, error = request_picture(self.record.chat_id, self.record.id, chart,
-                                                                   format_json_data(_data))
+                                with self.tracer.span(name="render_chart_picture",
+                                                      input={"chart_type": chart.get("type")},
+                                                      metadata={"operate": OperationEnum.GENERATE_PICTURE.value}) as _span:
+                                    image_url, error = request_picture(self.record.chat_id, self.record.id, chart,
+                                                                       format_json_data(_data))
+                                    _span.update(output={"image_url": image_url,
+                                                         "error": str(error) if error else None})
                                 SQLBotLogUtil.info(image_url)
                                 if stream:
                                     yield f'![{chart.get("type")}]({image_url})'

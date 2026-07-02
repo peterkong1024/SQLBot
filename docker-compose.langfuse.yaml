@@ -1,0 +1,28 @@
+services:
+  sqlbot:
+    image: sqlbot-langfuse:dev
+    container_name: sqlbot-langfuse-dev
+    restart: "no"
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      POSTGRES_DB: sqlbot
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: Password123@pg
+      PROJECT_NAME: "SQLBot"
+      DEFAULT_PWD: "SQLBot@123456"
+      SECRET_KEY: dev-secret-key-for-tracing-verification-only
+      BACKEND_CORS_ORIGINS: "http://localhost,http://localhost:5173"
+      LOG_LEVEL: "INFO"
+      SQL_DEBUG: "True"
+      # Keep table-vector retrieval off for a deterministic pipeline
+      TABLE_EMBEDDING_ENABLED: "false"
+      # Langfuse tracing -> host Langfuse instance
+      LANGFUSE_ENABLED: "true"
+      LANGFUSE_HOST: "http://host.docker.internal:3000"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY}"
+    volumes:
+      - ./data/dev/logs:/opt/sqlbot/app/logs
